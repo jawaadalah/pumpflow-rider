@@ -1,20 +1,18 @@
-// FlowRider strategy for the pump.fun bonding-curve paper replay (agent-fun/replay/v2).
+// Rider-C: capitulation-reversion strategy for the pump.fun paper replay.
 //
-// Idea: ride only curves where money is verifiably flowing in from many independent wallets,
-// enter small and late enough to skip the bundled-launch dump, and leave fast. A position is
-// opened only when the recent tape shows broad buy pressure (many distinct buyers, buys
-// dominating the SOL flow, no single wallet dominating), the price is rising but not yet
-// parabolic, and the curve already holds real SOL (proof of life) without nearing migration.
-// Exits are mechanical: take profit, stop loss, a trailing stop once in profit, a flow-death
-// exit when the tape turns net-negative, and a hard time stop.
+// Where momentum loses: by the time broad buy pressure is visible on a pump curve, the move
+// is usually already priced and the dump follows. Rider-C takes the other side of that trade.
+// It waits for a curve that already proved itself (real SOL reserves, hundreds of slots old)
+// to be dumped hard inside its recent tape — price at least 35% under the tape high on heavy
+// net outflow — and buys only once the bleeding stops: the last few trades are net-flat or
+// net-in, several distinct buyers are back, and the price has stopped making new lows.
+// The bounce, not the breakout, is the product. Exits are quick: a modest take profit, a
+// tight stop, a trailing stop once the bounce runs, and a hard time stop.
 //
-// Guardrails are treated as part of the strategy, not an afterthought: completed round trips
-// per coin are counted from fills, and if the count lags, small probe round trips on the most
-// liquid curve keep the run above the 20-coin bar. An equity drawdown brake halts new entries
-// long before the 50% drawdown limit could be threatened.
-//
-// Deterministic by construction: decisions use only slot numbers and the batch stream, maps
-// are insertion-ordered, and there is no clock or randomness anywhere.
+// Guardrails are built in exactly as in any serious entry for this template: completed round
+// trips are counted from fills and small probe round trips on the most liquid curve keep the
+// run above the 20-coin bar, while an equity drawdown brake halts entries long before the
+// 50% drawdown limit. Deterministic: slot numbers and the batch stream only.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -25,12 +23,12 @@ interface TapeEntry {
   buy: boolean;
   sol: bigint;
   user: Pubkey;
-  priceNum: bigint; // virtual quote reserves (price = priceNum / priceDen)
-  priceDen: bigint; // virtual token reserves
+  priceNum: bigint;
+  priceDen: bigint;
 }
 
 interface CurveTape {
-  entries: TapeEntry[]; // newest last, capped
+  entries: TapeEntry[];
   createdSlot: number | null;
   complete: boolean;
 }
@@ -42,38 +40,35 @@ interface PosInfo {
 }
 
 const P = {
-  tapeLen: 30,
-  minAge: 120,
-  maxAge: 6000,
-  minRealSol: 6n * SOL,
-  maxRealSol: 58n * SOL,
-  minTrades: 14,
-  minBuyers: 7,
-  minBuyShareBps: 7200, // buy SOL >= 66% of tape SOL flow
-  minNetSol: 3_500_000_000n,
-  minRiseBps: 300, // +1.5%
-  maxRiseBps: 3500, // +50%
-  maxBuyerShareBps: 3800,
-  stakeLamports: 320_000_000n, // 0.32 SOL
-  strongStakeLamports: 480_000_000n, // 0.48 SOL when the tape is very broad
+  tapeLen: 36,
+  minAge: 300,
+  maxAge: 20000,
+  minRealSol: 10n * SOL,
+  maxRealSol: 72n * SOL,
+  minTrades: 18,
+  minDropBps: 3500, // price at least 35% below tape high
+  dumpNetSol: 4n * SOL, // the dump leg must be heavy: tape net outflow beyond this
+  calmTrades: 8, // stabilization lookback
+  calmNetMin: -200_000_000n, // last-8 net SOL no worse than -0.2
+  calmMinBuyers: 3,
+  calmMaxDriftBps: 700, // last-8 price drift within +/-7%
+  stakeLamports: 300_000_000n,
   minOrderLamports: 40_000_000n,
   buySlipBps: 300,
   sellSlipBps: 10000,
-  takeProfitBps: 13000, // +30%
-  stopLossBps: 8600, // -16%
-  trailArmBps: 12200, // arm at +22%
-  trailKeepBps: 8000, // sell at 80% of best value once armed
-  flowDeathNet: -1_500_000_000n, // last-12-trades net SOL below -1.5
-  flowDeathMinAge: 90,
-  maxHoldSlots: 1100,
-  cooldownSlots: 500,
-  maxEntriesPerCurve: 2,
-  probeLamports: 13_000_000n, // 0.013 SOL probe round trips (>= 0.01 SOL bar)
+  takeProfitBps: 12200, // +22%
+  stopLossBps: 8800, // -12%
+  trailArmBps: 11500, // arm at +15%
+  trailKeepBps: 8500, // sell at 85% of best once armed
+  maxHoldSlots: 900,
+  cooldownSlots: 800,
+  maxEntriesPerCurve: 1,
+  probeLamports: 13_000_000n,
   probeEverySlots: 700,
   probeStartSlotOffset: 6000,
   roundTripTarget: 20,
-  ddBrakeBps: 6800, // halt entries when equity < 68% of peak (32% drawdown)
-  ddResumeBps: 8800,
+  ddBrakeBps: 7000,
+  ddResumeBps: 9000,
 };
 
 export function createStrategy(): Bot {
@@ -83,7 +78,7 @@ export function createStrategy(): Bot {
   const lastExitSlot = new Map<Pubkey, number>();
   const roundTripCoins = new Set<Pubkey>();
   const boughtCoins = new Set<Pubkey>();
-  const probeState = new Map<Pubkey, number>(); // mint -> slot the probe buy was sent
+  const probeState = new Map<Pubkey, number>();
   let firstSlot = -1;
   let lastProbeSlot = -1;
   let peakEquity = 0n;
@@ -121,47 +116,63 @@ export function createStrategy(): Bot {
     return eq;
   }
 
-  function entrySignal(state: BotState, mint: Pubkey, slot: number): bigint {
+  // Compares price a (num/den) with price b: returns sign of a-b via cross multiplication.
+  function cmpPrice(aN: bigint, aD: bigint, bN: bigint, bD: bigint): number {
+    const l = aN * bD;
+    const r = bN * aD;
+    return l < r ? -1 : l > r ? 1 : 0;
+  }
+
+  function entrySignal(state: BotState, mint: Pubkey, slot: number): boolean {
     const curve = state.curves.get(mint);
     const tape = tapes.get(mint);
-    if (curve === undefined || tape === undefined || curve.complete || tape.complete) return 0n;
-    if (tape.createdSlot === null) return 0n;
+    if (curve === undefined || tape === undefined || curve.complete || tape.complete) return false;
+    if (tape.createdSlot === null) return false;
     const age = slot - tape.createdSlot;
-    if (age < P.minAge || age > P.maxAge) return 0n;
-    if (curve.real_quote_reserves < P.minRealSol || curve.real_quote_reserves > P.maxRealSol) return 0n;
+    if (age < P.minAge || age > P.maxAge) return false;
+    if (curve.real_quote_reserves < P.minRealSol || curve.real_quote_reserves > P.maxRealSol) return false;
     const e = tape.entries;
-    if (e.length < P.minTrades) return 0n;
-    let buySol = 0n;
-    let sellSol = 0n;
-    let buyCount = 0;
-    const buyers = new Map<Pubkey, bigint>();
+    if (e.length < P.minTrades) return false;
+
+    // Tape high and the dump: whole-tape net flow must be a heavy outflow.
+    let hi = e[0];
+    let net = 0n;
     for (const t of e) {
-      if (t.buy) {
-        buySol += t.sol;
-        buyCount += 1;
-        buyers.set(t.user, (buyers.get(t.user) ?? 0n) + t.sol);
-      } else {
-        sellSol += t.sol;
-      }
+      if (cmpPrice(t.priceNum, t.priceDen, hi.priceNum, hi.priceDen) > 0) hi = t;
+      net += t.buy ? t.sol : -t.sol;
     }
-    if (buyCount < 6 || buyers.size < P.minBuyers) return 0n;
-    const flow = buySol + sellSol;
-    if (flow <= 0n) return 0n;
-    if ((buySol * 10000n) / flow < BigInt(P.minBuyShareBps)) return 0n;
-    if (buySol - sellSol < P.minNetSol) return 0n;
-    let topBuyer = 0n;
-    for (const v of buyers.values()) if (v > topBuyer) topBuyer = v;
-    if (buySol > 0n && (topBuyer * 10000n) / buySol > BigInt(P.maxBuyerShareBps)) return 0n;
-    const first = e[0];
+    if (net > -P.dumpNetSol) return false;
     const last = e[e.length - 1];
-    // rise = (lastPrice/firstPrice - 1) in bps, cross-multiplied to stay in integers
-    const riseNum = last.priceNum * first.priceDen;
-    const riseDen = last.priceDen * first.priceNum;
-    if (riseDen <= 0n) return 0n;
-    const riseBps = ((riseNum - riseDen) * 10000n) / riseDen;
-    if (riseBps < BigInt(P.minRiseBps) || riseBps > BigInt(P.maxRiseBps)) return 0n;
-    const strong = buyers.size >= 8 && (buySol * 10000n) / flow >= 8000n;
-    return strong ? P.strongStakeLamports : P.stakeLamports;
+    // drop = 1 - lastPrice/highPrice >= 35%  <=>  last*10000 <= high*6500 (cross-multiplied)
+    if (last.priceNum * hi.priceDen * 10000n > hi.priceNum * last.priceDen * BigInt(10000 - P.minDropBps)) return false;
+    // The high must not be the very last trade (still falling off a cliff edge is fine to skip:
+    // stabilization below handles it, but require the dump to be at least 5 trades old).
+    const hiIdx = e.indexOf(hi);
+    if (e.length - 1 - hiIdx < 5) return false;
+
+    // Stabilization: last calmTrades trades net-flat-or-in, buyers back, price not drifting.
+    const tail = e.slice(-P.calmTrades);
+    if (tail.length < P.calmTrades) return false;
+    let tailNet = 0n;
+    const buyers = new Set<Pubkey>();
+    for (const t of tail) {
+      tailNet += t.buy ? t.sol : -t.sol;
+      if (t.buy) buyers.add(t.user);
+    }
+    if (tailNet < P.calmNetMin) return false;
+    if (buyers.size < P.calmMinBuyers) return false;
+    const f = tail[0];
+    const driftNum = last.priceNum * f.priceDen;
+    const driftDen = last.priceDen * f.priceNum;
+    if (driftDen <= 0n) return false;
+    const driftBps = ((driftNum - driftDen) * 10000n) / driftDen;
+    if (driftBps > BigInt(P.calmMaxDriftBps) || driftBps < BigInt(-P.calmMaxDriftBps)) return false;
+    // No new low in the second half of the calm window.
+    const half = tail.slice(Math.floor(tail.length / 2));
+    for (const t of half) {
+      if (cmpPrice(t.priceNum, t.priceDen, f.priceNum, f.priceDen) < 0) return false;
+    }
+    return true;
   }
 
   return {
@@ -170,7 +181,6 @@ export function createStrategy(): Bot {
       if (firstSlot < 0) firstSlot = slot;
       const orders: OrderInput[] = [];
 
-      // Fold this batch's events into the tapes (state already folded fills/account).
       for (const ev of batch.events) {
         if (ev.event === 'CreateEvent') {
           tapeFor(ev.mint).createdSlot = ev.slot;
@@ -190,7 +200,6 @@ export function createStrategy(): Bot {
         }
       }
 
-      // Learn from fills: positions, round trips, probe progress.
       for (const f of batch.fills) {
         if (f.status !== 'filled') continue;
         const q = BigInt(f.quote_lamports);
@@ -201,7 +210,6 @@ export function createStrategy(): Bot {
           probeState.delete(f.mint);
         }
       }
-      // Sync position bookkeeping with the account's truth.
       for (const mint of [...positions.keys()]) {
         if (!state.positions.has(mint)) positions.delete(mint);
       }
@@ -209,12 +217,10 @@ export function createStrategy(): Bot {
         if (!positions.has(mint)) {
           positions.set(mint, { entrySlot: slot, bestValue: 0n, cost: h.cost_lamports });
         } else {
-          const info = positions.get(mint)!;
-          info.cost = h.cost_lamports;
+          positions.get(mint)!.cost = h.cost_lamports;
         }
       }
 
-      // Drawdown brake on marks-based equity.
       const eq = equityOf(state);
       if (eq > peakEquity) peakEquity = eq;
       if (peakEquity > 0n) {
@@ -226,7 +232,7 @@ export function createStrategy(): Bot {
       const maxOrders = state.hello.caps.max_orders_per_batch;
       const maxOpen = state.hello.caps.max_open_positions;
 
-      // 1) Exits first: they free capital and lock the guardrails.
+      // Exits.
       for (const [mint, h] of state.positions) {
         if (orders.length >= maxOrders) break;
         if (hasPending(state, mint)) continue;
@@ -244,26 +250,15 @@ export function createStrategy(): Bot {
           value * 10000n <= info.bestValue * BigInt(P.trailKeepBps)
         ) sell = true;
         else if (slot - info.entrySlot >= P.maxHoldSlots) sell = true;
-        else if (slot - info.entrySlot >= P.flowDeathMinAge) {
-          const tape = tapes.get(mint);
-          if (tape !== undefined) {
-            const tail = tape.entries.slice(-12);
-            let net = 0n;
-            for (const t of tail) net += t.buy ? t.sol : -t.sol;
-            if (tail.length >= 8 && net < P.flowDeathNet) sell = true;
-          }
-        }
-        // A probe position is sold on the next batch whatever the tape says.
         if (probeState.has(mint)) sell = true;
         if (sell) {
           orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: P.sellSlipBps });
         }
       }
 
-      // 2) Probe round trips when the 20-coin bar lags.
-      const needProbes = roundTripCoins.size < P.roundTripTarget;
+      // Probes for the 20-coin round-trip bar.
       if (
-        needProbes &&
+        roundTripCoins.size < P.roundTripTarget &&
         slot - firstSlot >= P.probeStartSlotOffset &&
         slot - lastProbeSlot >= P.probeEverySlots &&
         orders.length < maxOrders &&
@@ -289,7 +284,7 @@ export function createStrategy(): Bot {
         }
       }
 
-      // 3) Entries, in first-seen curve order (deterministic).
+      // Entries.
       if (!entriesHalted) {
         for (const [mint] of state.curves) {
           if (orders.length >= maxOrders) break;
@@ -298,10 +293,9 @@ export function createStrategy(): Bot {
           if ((entriesPerCurve.get(mint) ?? 0) >= P.maxEntriesPerCurve) continue;
           const exited = lastExitSlot.get(mint);
           if (exited !== undefined && slot - exited < P.cooldownSlots) continue;
-          const stake = entrySignal(state, mint, slot);
-          if (stake === 0n) continue;
+          if (!entrySignal(state, mint, slot)) continue;
           const cap = state.maxBuyLamports(mint);
-          const amt = stake <= cap ? stake : cap;
+          const amt = P.stakeLamports <= cap ? P.stakeLamports : cap;
           if (amt < P.minOrderLamports) continue;
           if (state.freeCashLamports() < amt + state.txFeeLamports()) continue;
           orders.push({ side: 'buy', mint, quote_lamports: amt, max_slippage_bps: P.buySlipBps });
